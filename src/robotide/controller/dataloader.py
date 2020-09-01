@@ -32,6 +32,10 @@ class DataLoader(object):
     def load_initfile(self, path, load_observer):
         return self._load(_InitFileLoader(path), load_observer)
 
+    def load_resource_file(self, datafile, load_observer):
+        return self._load(_ResourceLoader(
+            datafile, self._namespace.get_resource), load_observer)
+
     def resources_for(self, datafile, load_observer):
         return self._load(_ResourceLoader(
             datafile, self._namespace.get_resources), load_observer)
@@ -43,7 +47,7 @@ class DataLoader(object):
     def _wait_until_loaded(self, loader, load_observer):
         loader.start()
         load_observer.notify()
-        while loader.isAlive():
+        while loader.is_alive():
             loader.join(0.1)
             load_observer.notify()
 

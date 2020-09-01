@@ -23,15 +23,12 @@ from robotide.publish.messages import RideOpenSuite, RideNewProject, RideFileNam
 
 from .basecontroller import WithNamespace, _BaseController
 from .dataloader import DataLoader
-from .filecontrollers import DataController, ResourceFileControllerFactory
+from .filecontrollers import DataController, ResourceFileControllerFactory, TestDataDirectoryController
 from .robotdata import NewTestCaseFile, NewTestDataDirectory
 from robotide.spec.librarydatabase import DATABASE_FILE
 from robotide.spec.librarymanager import LibraryManager
 from robotide.spec.xmlreaders import SpecInitializer
 from robotide.utils import overrides
-from robotide.utils import PY3
-if PY3:
-    from robotide.utils import unicode
 
 
 class Project(_BaseController, WithNamespace):
@@ -40,13 +37,14 @@ class Project(_BaseController, WithNamespace):
         self._library_manager = self._construct_library_manager(library_manager, settings)
         if not self._library_manager.is_alive():
             self._library_manager.start()
-        self._set_namespace(namespace)
+        self._name_space = namespace
+        self._set_namespace(self._name_space)
         self._settings = settings
-        self._loader = DataLoader(namespace, settings)
+        self._loader = DataLoader(self._name_space, settings)
         self._controller = None
         self.name = None
         self.external_resources = []
-        self._resource_file_controller_factory = ResourceFileControllerFactory(namespace, self)
+        self._resource_file_controller_factory = ResourceFileControllerFactory(self._name_space, self)
         self._serializer = Serializer(settings, LOG)
 
     def _construct_library_manager(self, library_manager, settings):
@@ -78,6 +76,8 @@ class Project(_BaseController, WithNamespace):
     def update_default_dir(self, path):
         default_dir = path if os.path.isdir(path) else os.path.dirname(path)
         self._settings.set('default directory', default_dir)
+        self._name_space.update_exec_dir_global_var(default_dir)
+        self._name_space.update_cur_dir_global_var(default_dir)
 
     # TODO: in all other controllers data returns a robot data model object.
     @property
@@ -112,7 +112,8 @@ class Project(_BaseController, WithNamespace):
     def _new_project(self, datafile):
         self.update_default_dir(datafile.directory)
         self._controller = DataController(datafile, self)
-        self._resource_file_controller_factory = ResourceFileControllerFactory(self._namespace, self)
+        self._resource_file_controller_factory = ResourceFileControllerFactory(self._namespace,
+                                                                               self)
         RideNewProject(path=datafile.source, datafile=datafile).publish()
 
     def new_resource(self, path, parent=None):
@@ -131,7 +132,7 @@ class Project(_BaseController, WithNamespace):
             return
         try:
             load_observer.error("Given file '%s' is not a valid Robot Framework "
-                            "test case or resource file." % path)
+                                "test case or resource file." % path)
         except AttributeError:  # DEBUG
             pass
 
@@ -174,7 +175,8 @@ class Project(_BaseController, WithNamespace):
         self._controller = DataController(datafile, self)
         new_resource_controllers = []
         for r in resources:
-            self._create_resource_controller(r, resource_created_callback=lambda controller: new_resource_controllers.append(controller))
+            self._create_resource_controller(r, resource_created_callback=lambda controller:
+                                             new_resource_controllers.append(controller))
         for controller in new_resource_controllers:
             self._inform_resource_created(controller)
 
@@ -185,14 +187,15 @@ class Project(_BaseController, WithNamespace):
         load_observer.error("Invalid resource file '%s'." % path)
 
     def _load_resource(self, path, load_observer):
-        resource = self._namespace.get_resource(path)
+        resource = self._loader.load_resource_file(path, load_observer)
         if not resource:
             return None
         ctrl = self._create_resource_controller(resource)
         load_observer.finish()
         return ctrl
 
-    def _create_resource_controller(self, parsed_resource, parent=None, resource_created_callback=None):
+    def _create_resource_controller(self, parsed_resource, parent=None,
+                                    resource_created_callback=None):
         old = self._resource_file_controller_factory.find(parsed_resource)
         if old:
             return old
@@ -216,7 +219,8 @@ class Project(_BaseController, WithNamespace):
         self.external_resources.sort(key=lambda resource: resource.name.lower())
 
     def get_all_keywords(self):
-        return self.get_all_keywords_from(ctrl.datafile for ctrl in self.datafiles if ctrl.datafile)
+        return self.get_all_keywords_from(ctrl.datafile for ctrl in self.datafiles if
+                                          ctrl.datafile)
 
     def all_testcases(self):
         for df in self._suites():
@@ -294,6 +298,17 @@ class Project(_BaseController, WithNamespace):
         if resource:
             return self._create_resource_controller(resource)
 
+    def is_project_changed_from_disk(self):
+        for data_file in self.datafiles:
+            if isinstance(data_file, TestDataDirectoryController):
+                if not os.path.exists(data_file.directory):
+                    return True
+            else:
+                if data_file.has_been_modified_on_disk() or \
+                        data_file.has_been_removed_from_disk():
+                    return True
+        return False
+
 
 class Serializer(object):
 
@@ -337,7 +352,7 @@ class Serializer(object):
 
     def _cache_error(self, data, error):
         self._errors.append("Error in serializing '%s':\n%s"
-                            % (data.data.source, unicode(error)))
+                            % (data.data.source, str(error)))
 
     def _log_errors(self):
         if self._errors:

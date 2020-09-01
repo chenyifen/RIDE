@@ -48,14 +48,12 @@ being used for a currently running test.
 import datetime
 import time
 import os
+import psutil
 import re
 import wx
 import wx.stc
 from functools import reduce
-try:
-    from Queue import Queue
-except ImportError: # Python 3
-    from queue import Queue
+from queue import Queue
 from wx.lib.embeddedimage import PyEmbeddedImage
 
 
@@ -63,40 +61,36 @@ from robotide.action.shortcut import localize_shortcuts
 from robotide.context import IS_WINDOWS, IS_MAC
 from robotide.contrib.testrunner import TestRunner
 from robotide.contrib.testrunner import runprofiles
+from robotide.controller.macrocontrollers import TestCaseController
 from robotide.publish import RideSettingsChanged, PUBLISHER
 from robotide.publish.messages import RideTestSelectedForRunningChanged
 from robotide.pluginapi import Plugin, ActionInfo
 from robotide.widgets import Label, ImageProvider
 from robotide.robotapi import LOG_LEVELS
-from robotide.utils import robottime, is_unicode, PY2
+from robotide.utils import robottime
 from robotide.preferences.editors import ReadFonts
 from sys import getfilesystemencoding
 from robotide.lib.robot.utils.encodingsniffer import (get_console_encoding,
                                                       get_system_encoding)
 CONSOLE_ENCODING = get_console_encoding()
-if PY2 and IS_WINDOWS:
-    SYSTEM_ENCODING = 'mbcs'
-else:
-    SYSTEM_ENCODING = get_system_encoding()
+SYSTEM_ENCODING = get_system_encoding()
 OUTPUT_ENCODING = getfilesystemencoding()
 encoding = {'CONSOLE': CONSOLE_ENCODING,
             'SYSTEM': SYSTEM_ENCODING,
             'OUTPUT': OUTPUT_ENCODING}
 
-# print("DEBUG: TestRunnerPlugin encoding=%s" % encoding)
-
-ID_RUN = wx.NewId()
-ID_RUNDEBUG = wx.NewId()
-ID_STOP = wx.NewId()
-ID_PAUSE = wx.NewId()
-ID_CONTINUE = wx.NewId()
-ID_STEP_NEXT = wx.NewId()
-ID_STEP_OVER = wx.NewId()
-ID_SHOW_REPORT = wx.NewId()
-ID_SHOW_LOG = wx.NewId()
-ID_AUTOSAVE = wx.NewId()
-ID_PAUSE_ON_FAILURE = wx.NewId()
-ID_SHOW_MESSAGE_LOG = wx.NewId()
+ID_RUN = wx.NewIdRef()
+ID_RUNDEBUG = wx.NewIdRef()
+ID_STOP = wx.NewIdRef()
+ID_PAUSE = wx.NewIdRef()
+ID_CONTINUE = wx.NewIdRef()
+ID_STEP_NEXT = wx.NewIdRef()
+ID_STEP_OVER = wx.NewIdRef()
+ID_SHOW_REPORT = wx.NewIdRef()
+ID_SHOW_LOG = wx.NewIdRef()
+ID_AUTOSAVE = wx.NewIdRef()
+ID_PAUSE_ON_FAILURE = wx.NewIdRef()
+ID_SHOW_MESSAGE_LOG = wx.NewIdRef()
 STYLE_DEFAULT = 0
 STYLE_STDERR = 2
 
@@ -130,7 +124,7 @@ class TestRunnerPlugin(Plugin):
     def __init__(self, application=None):
         Plugin.__init__(self, application, initially_enabled=True,
                         default_settings=self.defaults)
-        self.version = "3.01"
+        self.version = "3.1"
         self.metadata = {
             "url":
             "https://github.com/robotframework/RIDE/wiki/Test-Runner-Plugin"}
@@ -144,7 +138,15 @@ class TestRunnerPlugin(Plugin):
         self._test_runner = TestRunner(application.model)
         self._register_shortcuts()
         self._min_log_level_number = LOG_LEVELS['INFO']
-        self._names_to_run = set()
+        self._selected_tests: {TestCaseController} = set()
+        self._process = psutil.Process()
+        self._initmemory = None
+        self._limitmemory = None  # This will be +80%
+        self._maxmemmsg = None
+
+    @property
+    def _names_to_run(self):
+        return list(map(lambda ctrl: (ctrl.datafile_controller.longname, ctrl.longname), self._selected_tests))
 
     def _register_shortcuts(self):
         self.register_shortcut('CtrlCmd-C', self._copy_from_out)
@@ -231,7 +233,7 @@ class TestRunnerPlugin(Plugin):
             self.save_setting(setting, data.new)
 
     def OnTestSelectedForRunningChanged(self, message):
-        self._names_to_run = message.tests
+        self._selected_tests = message.tests
 
     def disable(self):
         self._remove_from_notebook()
@@ -274,29 +276,44 @@ class TestRunnerPlugin(Plugin):
         self.message_log = None
         self._right_panel.GetSizer().Layout()
 
+    def _recreate_message_log(self):
+        self.show_log_messages_checkbox.SetValue(False)
+        self._reset_memory_calc()
+        self.show_log_messages_checkbox.SetValue(True)
+
+    def _reset_memory_calc(self):
+        self._initmemory = self._process.memory_info()[0]
+        self._limitmemory = self._initmemory * 1.80
+        self._maxmemmsg = None
+
     def OnStop(self, event):
         """Called when the user clicks the "Stop" button
 
         This sends a SIGINT to the running process, with the
         same effect as typing control-c when running from the
         command line."""
+        self._reset_memory_calc()
         self._AppendText(self.out, '[ SENDING STOP SIGNAL ]\n',
                          source='stderr')
         self._test_runner.send_stop_signal()
 
     def OnPause(self, event):
+        self._reset_memory_calc()
         self._AppendText(self.out, '[ SENDING PAUSE SIGNAL ]\n')
         self._test_runner.send_pause_signal()
 
     def OnContinue(self, event):
+        self._reset_memory_calc()
         self._AppendText(self.out, '[ SENDING CONTINUE SIGNAL ]\n')
         self._test_runner.send_continue_signal()
 
     def OnStepNext(self, event):
+        self._reset_memory_calc()
         self._AppendText(self.out, '[ SENDING STEP NEXT SIGNAL ]\n')
         self._test_runner.send_step_next_signal()
 
     def OnStepOver(self, event):
+        self._reset_memory_calc()
         self._AppendText(self.out, '[ SENDING STEP OVER SIGNAL ]\n')
         self._test_runner.send_step_over_signal()
 
@@ -305,45 +322,36 @@ class TestRunnerPlugin(Plugin):
             It can still be overwritten in RIDE Arguments line
         """
         # Save the original function so we can inject "-L Debug"
-        tempFunc = self._create_command 
+        tempfunc = self._create_command
         self._create_command = self._create_debug_command
         # Do normal run with
         self.OnRun(event)
         # Restore original function
-        self._create_command = tempFunc
+        self._create_command = tempfunc
 
     def OnRun(self, event):
         """Called when the user clicks the "Run" button"""
         if not self._can_start_running_tests():
             return
-        #if no tests are selected warn the user, issue #1622
         if self.__getattr__('confirm run'):
-            if not self.tests_selected():
+            if not self._tests_selected():
                 if not self.ask_user_to_run_anyway():
                     # In Linux NO runs dialog 4 times
                     return
+        self._reset_memory_calc()
         self._initialize_ui_for_running()
         command = self._create_command()
-        if PY2:
-            self._output("command: %s\n" % command)  # DEBUG encode
-        else:
-            self._output("command: %s\n" % command, enc=False)  # DEBUG on Py3 it not shows correct if tags with latin chars
+        # DEBUG on Py3 it not shows correct if tags with latin chars
+        self._output("command: %s\n" % command, enc=False)
         try:
-            if PY2 and IS_WINDOWS:
-                cwd = self._get_current_working_dir()  # DEBUG It fails if a directory has chinese or latin symbols
-                cwd = cwd.encode(encoding['OUTPUT']) # DEBUG SYSTEM_ENCODING
-                # print("DEBUG: encoded cwd: %s" % cwd)
-                self._test_runner.run_command(command.encode(encoding['OUTPUT']), cwd)  # --include Áçãoµ
-            else:
-                self._test_runner.run_command(command, self._get_current_working_dir())
-            # self._output("DEBUG: Passed test_runner.run_command\n")
+            self._test_runner.run_command(command, self._get_current_working_dir())
             self._process_timer.Start(41)  # roughly 24fps
             self._set_running()
             self._progress_bar.Start()
         except Exception as e:
             # self._output("DEBUG: Except block test_runner.run_command\n")
             self._set_stopped()
-            error, log_message = self.get_current_profile().format_error(str(e), None)  # DEBUG unicode(e)
+            error, log_message = self.get_current_profile().format_error(str(e), None)
             self._output(error)
             if log_message:
                 log_message.publish()
@@ -398,8 +406,8 @@ class TestRunnerPlugin(Plugin):
                             wx.ICON_QUESTION | wx.YES_NO)
         return ret == wx.YES
 
-    def tests_selected(self):
-        return len(self._names_to_run) != 0
+    def _tests_selected(self):
+        return len(self._selected_tests) != 0
 
     def ask_user_to_run_anyway(self):
         ret = wx.MessageBox('No tests selected. \n'
@@ -429,14 +437,12 @@ class TestRunnerPlugin(Plugin):
     def OnShowReport(self, evt):
         """Called when the user clicks on the "Report" button"""
         if self._report_file:
-            wx.LaunchDefaultBrowser("file:%s" %
-                                    os.path.abspath(self._report_file))
+            wx.LaunchDefaultBrowser("file:%s" % os.path.abspath(self._report_file))
 
     def OnShowLog(self, evt):
         """Called when the user clicks on the "Log" button"""
         if self._log_file:
-            wx.LaunchDefaultBrowser("file:%s" %
-                                    os.path.abspath(self._log_file))
+            wx.LaunchDefaultBrowser("file:%s" % os.path.abspath(self._log_file))
 
     def OnProfileSelection(self, event):
         self.save_setting("profile", event.GetString())
@@ -448,14 +454,13 @@ class TestRunnerPlugin(Plugin):
         self._output(output)
         self._read_report_and_log_from_stdout_if_needed()
         if len(errors) > 0:
-            self._output("unexpected error: " + errors)
+            self._output(errors, source="stderr")
         if self._process_timer:
             self._process_timer.Stop()
         self._set_stopped()
         self._progress_bar.Stop()
-        now = datetime.datetime.now()
-        self._output("\ntest finished %s" %
-                     robottime.format_time(now.timetuple()))
+        self._output("\nTest finished {}".format(robottime.format_time(
+            datetime.datetime.now().timetuple())))
         self._test_runner.command_ended()
         if log_message:
             log_message.publish()
@@ -478,6 +483,19 @@ class TestRunnerPlugin(Plugin):
 
     def OnTimer(self, evt):
         """Get process output"""
+        if self.message_log and not self._messages_log_texts.empty():
+            if self._process.memory_info()[0] <= self._limitmemory:
+                texts = []
+                while not self._messages_log_texts.empty():
+                    texts += [self._messages_log_texts.get()]
+                self._AppendTextMessageLog(self.message_log, '\n' + '\n'.join(texts))
+            else:
+                if not self._maxmemmsg:
+                    self._maxmemmsg = "Messages log exceeded 80% of process " \
+                                      "memory, stopping for now..."
+                    self._AppendTextMessageLog(self.message_log,
+                                               '\n' + self._maxmemmsg,
+                                               source="stderr")
         if not self._test_runner.is_running():
             self.OnProcessEnded(None)
             return
@@ -494,11 +512,6 @@ class TestRunnerPlugin(Plugin):
                 # the previous character isn't a newline.
                 self._output("\n", source="stdout")
             self._output(err_buffer, source="stderr")
-        if self.message_log and not self._messages_log_texts.empty():
-            texts = []
-            while not self._messages_log_texts.empty():
-                texts += [self._messages_log_texts.get()]
-            self._AppendText(self.message_log, '\n'+'\n'.join(texts))
 
     def GetLastOutputChar(self):
         """Return the last character in the output window"""
@@ -516,9 +529,7 @@ class TestRunnerPlugin(Plugin):
         """
         result = []
         for arg in argv:
-            if PY2 and is_unicode(arg):
-                arg = arg.encode(encoding['SYSTEM'])  # DEBUG "utf-8") CONSOLE_ENCODING
-                # print("DEBUG: PY2 unicode args %s" % arg)
+            # arg = arg.encode(encoding['SYSTEM'])
             if "'" in arg or " " in arg or "&" in arg:
                 # for windows, if there are spaces we need to use
                 # double quotes. Single quotes cause problems
@@ -527,7 +538,7 @@ class TestRunnerPlugin(Plugin):
                 result.append("'%s'" % arg)
             else:
                 result.append(arg)
-        return " ".join(result)  # DEBUG added bytes
+        return " ".join(result)
 
     def _show_notebook_tab(self):
         """Show the Run notebook tab"""
@@ -536,6 +547,9 @@ class TestRunnerPlugin(Plugin):
             self._reload_model()
         self.show_tab(self.panel)
 
+    # from memory_profiler import profile as mprofile
+
+    # @mprofile
     def _AppendText(self, textctrl, string, source="stdout", enc=True):
         if not self.panel or not textctrl:
             return
@@ -543,44 +557,74 @@ class TestRunnerPlugin(Plugin):
         # we need this information to decide whether to autoscroll or not
         new_text_start = textctrl.GetLength()
         linecount = textctrl.GetLineCount()
-        lastVisibleLine = textctrl.GetFirstVisibleLine() + \
+        last_visible_line = textctrl.GetFirstVisibleLine() + textctrl.LinesOnScreen() - 1
+
+        textctrl.SetReadOnly(False)
+        try:
+            if enc:
+                if IS_WINDOWS:
+                    textctrl.AppendText(string.encode('mbcs'))
+                else:
+                    textctrl.AppendText(string.encode(encoding['SYSTEM']))  # string.encode('UTF-8'))  # DEBUG removed bytes
+            else:
+                textctrl.AppendText(string.encode(encoding['OUTPUT']))
+        except UnicodeDecodeError as e:
+            # I'm not sure why I sometimes get this, and I don't know what I
+            # can do other than to ignore it.
+            # print(f"DEBUG: Console print UnicodeDecodeError string is {string}")
+            textctrl.AppendTextRaw(string)  # DEBUG removed bytes
+        except UnicodeEncodeError as e:
+            # I'm not sure why I sometimes get this, and I don't know what I
+            # can do other than to ignore it.
+            # print(f"DEBUG: Console print UnicodeEncodeError string is {string}")
+            textctrl.AppendTextRaw(string.encode(encoding['CONSOLE']))  # .encode('mbcs'))
+
+        new_text_end = textctrl.GetLength()
+
+        if wx.VERSION < (4, 1, 0):
+            textctrl.StartStyling(new_text_start, 0x1f)
+        else:
+            textctrl.StartStyling(new_text_start)
+        if source == "stderr":
+            textctrl.SetStyling(new_text_end-new_text_start, STYLE_STDERR)
+
+        textctrl.SetReadOnly(True)
+        if last_visible_line >= linecount-4:
+            linecount = textctrl.GetLineCount()
+            textctrl.ScrollToLine(linecount)
+
+    def _AppendTextMessageLog(self, textctrl, string, source="stdout", enc=True):
+        if not self.panel or not textctrl:
+            return
+        textctrl.update_scroll_width(string)
+        # we need this information to decide whether to autoscroll or not
+        new_text_start = textctrl.GetLength()
+        linecount = textctrl.GetLineCount()
+        last_visible_line = textctrl.GetFirstVisibleLine() + \
                           textctrl.LinesOnScreen() - 1
 
         textctrl.SetReadOnly(False)
         try:
             if enc:
-                textctrl.AppendText(string.encode(encoding['SYSTEM']))
+                textctrl.AppendText(string.encode(encoding['OUTPUT']))
             else:
                 textctrl.AppendText(string)
-            # print("DEBUG _AppendText Printed OK")
         except UnicodeDecodeError as e:
-            # I'm not sure why I sometimes get this, and I don't know what I
-            # can do other than to ignore it.
-            if PY2:
-                if is_unicode(string):
-                    textctrl.AppendTextRaw(bytes(string.encode('utf-8')))
-                else:
-                    textctrl.AppendTextRaw(string)
-            else:
-                textctrl.AppendTextRaw(bytes(string, encoding['SYSTEM']))  # DEBUG .encode('utf-8'))
-            # print(r"DEBUG UnicodeDecodeError appendtext string=%s\n" % string)
-            pass
+            textctrl.AppendTextRaw(string.encode(encoding['SYSTEM']))
         except UnicodeEncodeError as e:
-            # I'm not sure why I sometimes get this, and I don't know what I
-            # can do other than to ignore it.
             textctrl.AppendText(string.encode('utf-8'))  # DEBUG .encode('utf-8'))
-            # print(r"DEBUG UnicodeDecodeError appendtext string=%s\n" % string)
-            pass
-            #  raise  # DEBUG
 
         new_text_end = textctrl.GetLength()
 
-        textctrl.StartStyling(new_text_start, 0x1f)
+        if wx.VERSION < (4, 1, 0):
+            textctrl.StartStyling(new_text_start, 0x1f)
+        else:
+            textctrl.StartStyling(new_text_start)
         if source == "stderr":
             textctrl.SetStyling(new_text_end-new_text_start, STYLE_STDERR)
 
         textctrl.SetReadOnly(True)
-        if lastVisibleLine >= linecount-4:
+        if last_visible_line >= linecount-4:
             linecount = textctrl.GetLineCount()
             textctrl.ScrollToLine(linecount)
 
@@ -588,10 +632,7 @@ class TestRunnerPlugin(Plugin):
         # robot wants to know a fixed size for output, so calculate the
         # width of the window based on average width of a character. A
         # little is subtracted just to make sure there's a little margin
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            out_width, _ = self.out.GetSize()
-        else:
-            out_width, _ = self.out.GetSizeTuple()
+        out_width, _ = self.out.GetSize()
         char_width = self.out.GetCharWidth()
         return str(int(out_width/char_width)-10)
 
@@ -621,43 +662,30 @@ class TestRunnerPlugin(Plugin):
     def _build_runner_toolbar(self):
         toolbar = wx.ToolBar(self.panel, wx.ID_ANY,
                              style=wx.TB_HORIZONTAL | wx.TB_HORZ_TEXT)
-        # DEBUG wxPhoenix toolbar.AddLabelTool(
-        self.MyAddTool(toolbar, ID_RUN, "Start", ImageProvider().TOOLBAR_PLAY,
-                       shortHelp="Start robot",
-                       longHelp="Start running the robot test suite")
-        self.MyAddTool(toolbar, ID_RUNDEBUG, "Debug", getBugIconBitmap(),
-                       shortHelp="Start robot",
-                       longHelp="Start running the robot test suite "
-                                "with DEBUG loglevel")
-        self.MyAddTool(toolbar, ID_STOP, "Stop", ImageProvider().TOOLBAR_STOP,
-                       shortHelp="Stop a running test",
-                       longHelp="Stop a running test")
-        self.MyAddTool(toolbar, ID_PAUSE, "Pause",
-                       ImageProvider().TOOLBAR_PAUSE,
-                       shortHelp="Pause test execution",
-                       longHelp="Pause test execution")
-        self.MyAddTool(toolbar, ID_CONTINUE, "Continue",
-                       ImageProvider().TOOLBAR_CONTINUE,
-                       shortHelp="Continue test execution",
-                       longHelp="Continue test execution")
-        self.MyAddTool(toolbar, ID_STEP_NEXT, "Next",
-                       ImageProvider().TOOLBAR_NEXT,
-                       shortHelp="Step next", longHelp="Step next")
-        self.MyAddTool(toolbar, ID_STEP_OVER, "Step over",
-                       ImageProvider().TOOLBAR_NEXT,
-                       shortHelp="Step over", longHelp="Step over")
+        toolbar.AddTool(ID_RUN, "Start", ImageProvider().TOOLBAR_PLAY,wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Start robot", longHelp="Start running the "
+                                                                          "robot test suite")
+        toolbar.AddTool(ID_RUNDEBUG, "Debug", getBugIconBitmap(), wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Start robot", longHelp="Start running the "
+                                                                          "robot test suite with "
+                                                                          "DEBUG loglevel")
+        toolbar.AddTool(ID_STOP, "Stop", ImageProvider().TOOLBAR_STOP, wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Stop a running test", longHelp="Stop a "
+                                                                                  "running test")
+        toolbar.AddTool(ID_PAUSE, "Pause", ImageProvider().TOOLBAR_PAUSE, wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Pause test execution", longHelp="Pause test "
+                                                                                   "execution")
+        toolbar.AddTool(ID_CONTINUE, "Continue", ImageProvider().TOOLBAR_CONTINUE, wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Continue test execution", longHelp="Continue "
+                                                                                      "test "
+                                                                                      "execution")
+        toolbar.AddTool(ID_STEP_NEXT, "Next", ImageProvider().TOOLBAR_NEXT, wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Step next", longHelp="Step next")
+        toolbar.AddTool(ID_STEP_OVER, "Step over", ImageProvider().TOOLBAR_NEXT, wx.NullBitmap,
+                        wx.ITEM_NORMAL, shortHelp="Step over", longHelp="Step over")
         toolbar.Realize()
         self._bind_runner_toolbar_events(toolbar)
         return toolbar
-
-    def MyAddTool(self, obj, toolid, label, bitmap, bmpDisabled=wx.NullBitmap,
-                  kind=wx.ITEM_NORMAL, shortHelp="", longHelp=""):
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            obj.AddTool(toolid, label, bitmap, bmpDisabled, kind,
-                        shortHelp, longHelp)
-        else:
-            obj.AddLabelTool(toolid, label, bitmap, shortHelp=shortHelp,
-                             longHelp=longHelp)
 
     def _bind_runner_toolbar_events(self, toolbar):
         for event, callback, id in ((wx.EVT_TOOL, self.OnRun, ID_RUN),
@@ -676,21 +704,20 @@ class TestRunnerPlugin(Plugin):
     def _build_local_toolbar(self):
         toolbar = wx.ToolBar(self.panel, wx.ID_ANY,
                              style=wx.TB_HORIZONTAL | wx.TB_HORZ_TEXT)
-        profileLabel = Label(toolbar, label="Execution Profile:  ")
+        profile_label = Label(toolbar, label="Execution Profile:  ")
         choices = self._test_runner.get_profile_names()
         self.choice = wx.Choice(toolbar, wx.ID_ANY, choices=choices)
         self.choice.SetToolTip(wx.ToolTip("Choose which method to use for "
                                           "running the tests"))
-        toolbar.AddControl(profileLabel)
+        toolbar.AddControl(profile_label)
         toolbar.AddControl(self.choice)
         toolbar.AddSeparator()
-        reportImage = getReportIconBitmap()
-        logImage = getLogIconBitmap()
-        # DEBUG wxPhoenix toolbar.AddLabelTool(
-        self.MyAddTool(toolbar, ID_SHOW_REPORT, " Report", reportImage,
+        report_image = getReportIconBitmap()
+        log_image = getLogIconBitmap()
+        toolbar.AddTool(ID_SHOW_REPORT, " Report", report_image,
                        shortHelp=localize_shortcuts("View Robot Report in "
                                                     "Browser (CtrlCmd-R)"))
-        self.MyAddTool(toolbar, ID_SHOW_LOG, " Log", logImage,
+        toolbar.AddTool(ID_SHOW_LOG, " Log", log_image,
                        shortHelp=localize_shortcuts("View Robot Log in"
                                                     " Browser (CtrlCmd-L)"))
         toolbar.AddSeparator()
@@ -750,10 +777,6 @@ class TestRunnerPlugin(Plugin):
         p = self._test_runner.get_profile(profile)
         for child in self.config_sizer.GetChildren():
             child.GetWindow().Hide()
-            # if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix #TODO fix BoxSizer
-            #     self.config_sizer.RemoveChild(child.GetWindow())
-            # else:
-            #     self.config_sizer.Remove(child.GetWindow())
             self.config_sizer.Detach(child.GetWindow())
         toolbar = p.get_toolbar(self.config_panel)
 
@@ -808,7 +831,8 @@ class TestRunnerPlugin(Plugin):
 
     def _create_output_textctrl(self):
         textctrl = OutputStyledTextCtrl(self._right_panel)
-        # textctrl.StyleSetFontEncoding(wx.stc.STC_STYLE_DEFAULT, wx.FONTENCODING_CP936)  # DEBUG Chinese wx.) wx.FONTENCODING_SYSTEM
+        # textctrl.StyleSetFontEncoding(wx.stc.STC_STYLE_DEFAULT, wx.FONTENCODING_CP936)
+        # DEBUG Chinese wx.) wx.FONTENCODING_SYSTEM
         textctrl.SetScrollWidth(100)
         self._set_margins(textctrl)
         textctrl.SetReadOnly(True)
@@ -855,16 +879,16 @@ class TestRunnerPlugin(Plugin):
             self._append_to_message_log('<< CONTINUE >>')
 
     def _handle_start_test(self, args):
-        longname = args[1]['longname']
-        self._append_to_message_log('Starting test: %s' % longname)
+        longname = args[1]['longname'].encode('utf-8')
+        self._append_to_message_log(f"Starting test: {longname.decode(encoding['OUTPUT'], 'backslashreplace')}")
 
     def _append_to_message_log(self, text):
         if self.show_message_log:
             self._messages_log_texts.put(text)
 
     def _handle_end_test(self, args):
-        longname = args[1]['longname']
-        self._append_to_message_log('Ending test:   %s\n' % longname)
+        longname = args[1]['longname'].encode('utf-8')
+        self._append_to_message_log(f"Ending test: {longname.decode(encoding['OUTPUT'], 'backslashreplace')}\n")
         if args[1]['status'] == 'PASS':
             self._progress_bar.add_pass()
         else:
@@ -1032,8 +1056,6 @@ class OutputStyledTextCtrl(wx.stc.StyledTextCtrl):
             if self.GetScrollWidth() < width + 50:
                 self.SetScrollWidth(width + 50)
         except UnicodeDecodeError:
-            # print("DEBUG: UnicodeDecodeError at update scroll,
-            # testrunnerplugin, string is %s\n" % string)
             pass
 
 
@@ -1046,13 +1068,13 @@ class OutputStylizer(object):
         PUBLISHER.subscribe(self.OnSettingsChanged, RideSettingsChanged)
 
     def OnSettingsChanged(self, data):
-        '''Redraw colors and font if settings are modified'''
+        """Redraw colors and font if settings are modified"""
         section, setting = data.keys
         if section == 'Test Runner':
             self._set_styles()
 
     def _set_styles(self):
-        '''Sets plugin styles'''
+        """Sets plugin styles"""
         background = self.settings.get('background', 'white')
         font_size = self.settings.get('font size', 10)
         font_face = self.settings.get('font face', 'Courier New')

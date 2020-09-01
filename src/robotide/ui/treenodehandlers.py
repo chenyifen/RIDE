@@ -30,7 +30,7 @@ from robotide.controller.filecontrollers import (
 from robotide.editor.editordialogs import (
     TestCaseNameDialog, UserKeywordNameDialog, ScalarVariableDialog,
     ListVariableDialog, CopyUserKeywordDialog, DictionaryVariableDialog)
-from robotide.publish import RideOpenVariableDialog
+from robotide.publish import RideOpenVariableDialog, RideTestSelectedForRunningChanged, PUBLISHER
 from robotide.ui.progress import LoadProgressObserver
 from robotide.usages.UsageRunner import Usages, ResourceFileUsages
 from .filedialogs import (
@@ -55,7 +55,7 @@ def action_handler_class(controller):
     }[controller.__class__]
 
 
-class _ActionHandler(wx.Window):
+class _ActionHandler:
     is_user_keyword = False
     is_test_suite = False
     is_variable = False
@@ -88,13 +88,11 @@ class _ActionHandler(wx.Window):
     _label_open_folder =  'Open Containing Folder'
 
     def __init__(self, controller, tree, node, settings):
-        wx.Window.__init__(self, tree)
         self.controller = controller
         self._tree = tree
         self._node = node
         self._settings = settings
         self._rendered = False
-        self.Show(False)
         self._popup_creator = tree._popup_creator
 
     @property
@@ -106,7 +104,7 @@ class _ActionHandler(wx.Window):
         return self._node
 
     def show_popup(self):
-        self._popup_creator.show(self, PopupMenuItems(self, self._actions),
+        self._popup_creator.show(self._tree, PopupMenuItems(self, self._actions),
                                  self.controller)
 
     def begin_label_edit(self):
@@ -155,7 +153,7 @@ class _ActionHandler(wx.Window):
         self._tree.SelectAllTests(self._node)
 
     def OnDeselectAllTests(self, event):
-        self._tree.DeselectAllTests(self._node)
+        self._tree.SelectAllTests(self._node, False)
 
     def OnSelectOnlyFailedTests(self, event):
         self._tree.SelectFailedTests(self._node)
@@ -488,7 +486,7 @@ class TestCaseFileHandler(_FileHandlerThanCanBeRenamed, TestDataHandler):
 
     @overrides(_FileHandlerThanCanBeRenamed)
     def _rename_ok_handler(self):
-        self._tree.DeselectAllTests(self._node)
+        self._tree.SelectAllTests(self._node,False)
 
 
 class _TestOrUserKeywordHandler(_CanBeRenamed, _ActionHandler):
@@ -524,6 +522,11 @@ class _TestOrUserKeywordHandler(_CanBeRenamed, _ActionHandler):
 
 
 class TestCaseHandler(_TestOrUserKeywordHandler):
+    def __init__(self, controller, tree, node, settings):
+        _TestOrUserKeywordHandler.__init__(self, controller, tree, node, settings)
+        PUBLISHER.subscribe(self.test_selection_changed, RideTestSelectedForRunningChanged,
+                            key=self)  # TODO: unsubscribe when the object is destroyed!
+
     _datalist = property(lambda self: self.item.datalist)
     _copy_name_dialog_class = TestCaseNameDialog
 
@@ -533,6 +536,13 @@ class TestCaseHandler(_TestOrUserKeywordHandler):
     def _create_rename_command(self, new_name):
         return RenameTest(new_name)
 
+    def test_selection_changed(self, message: RideTestSelectedForRunningChanged):
+        if self.controller in message.tests:
+            if not self.node.GetValue():
+                self._tree.CheckItem(self.node, checked=True)
+        else:
+            if self.node.GetValue():
+                self._tree.CheckItem(self.node, checked=False)
 
 class UserKeywordHandler(_TestOrUserKeywordHandler):
     is_user_keyword = True
@@ -547,7 +557,7 @@ class UserKeywordHandler(_TestOrUserKeywordHandler):
     def _create_rename_command(self, new_name):
         return RenameKeywordOccurrences(
             self.controller.name, new_name,
-            RenameProgressObserver(self.GetParent().GetParent()),
+            RenameProgressObserver(self._tree.GetParent()),
             self.controller.info)
 
     def OnFindUsages(self, event):
@@ -591,9 +601,9 @@ class ResourceRootHandler(_ActionHandler):
 
     def OnAddResource(self, event):
         path = RobotFilePathDialog(
-            self, self.controller, self._settings).execute()
+            self._tree.GetParent(), self.controller, self._settings).execute()
         if path:
-            self.controller.load_resource(path, LoadProgressObserver(self))
+            self.controller.load_resource(path, LoadProgressObserver(self._tree.GetParent()))
 
 
 class ExcludedDirectoryHandler(TestDataDirectoryHandler):

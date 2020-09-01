@@ -16,40 +16,39 @@
 import os
 import wx
 import wx.lib.agw.aui as aui
-from wx import Icon
-from wx.lib.agw.aui import aui_switcherdialog as ASD
-from robotide.lib.robot.utils.compat import with_metaclass
+from wx.adv import TaskBarIcon, TBI_DOCK
 from robotide.action import ActionInfoCollection, ActionFactory, SeparatorInfo
-from robotide.context import ABOUT_RIDE, SHORTCUT_KEYS
+from robotide.context import ABOUT_RIDE, SHORTCUT_KEYS, IS_MAC
 from robotide.controller.ctrlcommands import SaveFile, SaveAll
-from robotide.publish import RideSaveAll, RideClosing, RideSaved, PUBLISHER,\
-    RideInputValidationError, RideTreeSelection, RideModificationPrevented
+from robotide.publish import RideSaveAll, RideClosing, RideSaved, PUBLISHER, \
+    RideInputValidationError, RideTreeSelection, RideModificationPrevented, RideBeforeSaving
 from robotide.ui.tagdialogs import ViewAllTagsDialog
 from robotide.ui.filedialogs import RobotFilePathDialog
-from robotide.utils import RideEventHandler, PY2
+from robotide.utils import RideFSWatcherHandler
 from robotide.widgets import Dialog, ImageProvider, HtmlWindow
 from robotide.preferences import PreferenceEditor
 
-from .actiontriggers import ( MenuBar, ToolBarButton, ShortcutRegistry,
-                              _RideSearchMenuItem)
+from .actiontriggers import (MenuBar, ToolBarButton, ShortcutRegistry, _RideSearchMenuItem)
 from .filedialogs import (NewProjectDialog, InitFileFormatDialog)
 from .review import ReviewDialog
 from .pluginmanager import PluginManager
 from robotide.action.shortcut import localize_shortcuts
-from .tree import Tree
+from .treeplugin import Tree
+from .fileexplorerplugin import FileExplorer
 from .notebook import NoteBook
 from .progress import LoadProgressObserver
+from ..editor import customsourceeditor
 
 
 _menudata = """
 [File]
-!&New Project | Create a new top level suite | Ctrlcmd-N
+!&New Project | Create a new top level suite | Ctrlcmd-N | ART_NEW
 ---
 !&Open Test Suite | Open file containing tests | Ctrlcmd-O | ART_FILE_OPEN
-!Open &Directory | Open directory containing datafiles | Shift-Ctrlcmd-O | \
-ART_FOLDER_OPEN
+!Open &Directory | Open directory containing datafiles | Shift-Ctrlcmd-O | ART_FOLDER_OPEN
+!Open External File | Open file in Code Editor | | ART_NORMAL_FILE
 ---
-&Save | Save selected datafile | Ctrlcmd-S | ART_FILE_SAVE
+!&Save | Save selected datafile | Ctrlcmd-S | ART_FILE_SAVE
 !Save &All | Save all changes | Ctrlcmd-Shift-S | ART_FILE_SAVE_AS
 ---
 !E&xit | Exit RIDE | Ctrlcmd-Q
@@ -72,9 +71,6 @@ ART_FOLDER_OPEN
 ID_CustomizeToolbar = wx.ID_HIGHEST + 1
 ID_SampleItem = ID_CustomizeToolbar + 1
 
-# Metaclass fix from http://code.activestate.com/recipes/
-# 204197-solving-the-metaclass-conflict/
-from robotide.utils.noconflict import classmaker
 
 ### DEBUG some testing
 # -- SizeReportCtrl --
@@ -140,14 +136,13 @@ class SizeReportCtrl(wx.Control):
         self.Refresh()
 
 
-class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
+class RideFrame(wx.Frame):
 
     def __init__(self, application, controller):
         size = application.settings.get('mainframe size', (1100, 700))
-        wx.Frame.__init__(self, parent=None, id = wx.ID_ANY, title='RIDE',
+        wx.Frame.__init__(self, parent=None, id=wx.ID_ANY, title='RIDE',
                           pos=application.settings.get('mainframe position', (50, 30)),
-                          size=size,
-                          style=wx.DEFAULT_FRAME_STYLE | wx.SUNKEN_BORDER)
+                          size=size, style=wx.DEFAULT_FRAME_STYLE | wx.SUNKEN_BORDER)
 
         # set Left to Right direction (while we don't have localization)
         self.SetLayoutDirection(wx.Layout_LeftToRight)
@@ -158,9 +153,6 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
         # tell AuiManager to manage this frame
         self._mgr.SetManagedWindow(self)
 
-        # set frame icon
-        # self.SetIcon(Icon('widgets/robot.ico')) # Maybe is not needed
-        # self.SetMinSize(size)
         self.SetMinSize(wx.Size(400, 300))
 
         self.ensure_on_screen()
@@ -168,27 +160,21 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
             self.Maximize()
         self._application = application
         self._controller = controller
-        self.favicon = Icon(os.path.join(os.path.dirname(__file__), "..",
-                                         "widgets","robot.ico"),
-                            wx.BITMAP_TYPE_ICO, 256, 256)
-        self.SetIcon(self.favicon)
+        self._image_provider = ImageProvider()
         self._init_ui()
+        self._task_bar_icon = RIDETaskBarIcon(self._image_provider)
         self._plugin_manager = PluginManager(self.notebook)
         self._review_dialog = None
         self._view_all_tags_dialog = None
+        self._current_external_dir = None
         self.Bind(wx.EVT_CLOSE, self.OnClose)
         self.Bind(wx.EVT_SIZE, self.OnSize)
         self.Bind(wx.EVT_MOVE, self.OnMove)
         self.Bind(wx.EVT_MAXIMIZE, self.OnMaximize)
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            self.Bind(wx.EVT_DIRCTRL_FILEACTIVATED, self.OnOpenFile)
-            self.Bind(wx.EVT_TREE_ITEM_RIGHT_CLICK, self.OnMenuOpenFile)
+        self.Bind(wx.EVT_DIRCTRL_FILEACTIVATED, self.OnOpenFile)
+        self.Bind(wx.EVT_TREE_ITEM_RIGHT_CLICK, self.OnMenuOpenFile)
         self._subscribe_messages()
-        #print("DEBUG: Call register_tools, actions: %s" % self.actions.__repr__())
-        if PY2:
-            wx.CallLater(100, self.actions.register_tools)  # DEBUG
-        else:
-            wx.CallAfter(self.actions.register_tools)  # DEBUG
+        wx.CallAfter(self.actions.register_tools)  # DEBUG
 
     def _subscribe_messages(self):
         for listener, topic in [
@@ -272,37 +258,19 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
         
         ##### End Test
         """
-        # self._mgr.AddPane(self.CreateTreeControl(),
-        #                  aui.AuiPaneInfo().Name("tree_content").
-        #                  CenterPane().Hide().MinimizeButton(True))
-        ###### self.tree = Tree(self.splitter, self.actions, self._application.settings)
-        self.tree = Tree(self, self.actions,
-                         self._application.settings)
-        #self.tree.SetMinSize(wx.Size(100, 200))
+        # Tree is always created here
+        self.tree = Tree(self, self.actions, self._application.settings)
         self.tree.SetMinSize(wx.Size(120, 200))
-        self._mgr.AddPane(self.tree,
-                          aui.AuiPaneInfo().Name("tree_content").
-                          Caption("Test Suites").LeftDockable(True).
-                          CloseButton(False))
-        # MaximizeButton(True).MinimizeButton(True))
-        self.actions.register_actions(
-            ActionInfoCollection(_menudata, self, self.tree))
-        ###### File explorer pane
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            self.filemgr = wx.GenericDirCtrl(self, -1, size=(200, 225),
-                                             style=wx.DIRCTRL_3D_INTERNAL)
-            self.filemgr.SetMinSize(wx.Size(120, 200))
-            # wx.CallAfter(self.filemgr.SetPath(self.tree.get_selected_datafile()))
-            self._mgr.AddPane(self.filemgr,
-                              aui.AuiPaneInfo().Name("file_manager").
-                              Caption("Files").LeftDockable(True).
-                              CloseButton(True))
+        # TreePlugin will manage showing the Tree
+        self.actions.register_actions(ActionInfoCollection(_menudata, self, self.tree))
+        ###### File explorer panel is always created here
+        self.filemgr = FileExplorer(self, self._controller)
+        self.filemgr.SetMinSize(wx.Size(120, 200))
 
         mb.take_menu_bar_into_use()
-        #### self.splitter.SetMinimumPaneSize(100)
-        #### self.splitter.SplitVertically(self.tree, self.notebook, 300)
         self.CreateStatusBar()
-        self.SetIcons(ImageProvider().PROGICONS)
+        # set main frame icon
+        self.SetIcons(self._image_provider.PROGICONS)
         # tell the manager to "commit" all the changes just made
         self._mgr.Update()
 
@@ -361,29 +329,33 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def OnClose(self, event):
         if self._allowed_to_exit():
+            perspective = self._mgr.SavePerspective()
+            self._application.settings.set('AUI Perspective', perspective)
             PUBLISHER.unsubscribe(self._set_label, RideTreeSelection)
             RideClosing().publish()
             # deinitialize the frame manager
             self._mgr.UnInit()
+            self._task_bar_icon.Destroy()
             self.Destroy()
         else:
             wx.CloseEvent.Veto(event)
 
     def OnSize(self, event):
-        if not self.IsMaximized():
-            self._application.settings['mainframe maximized'] = False
-            self._application.settings['mainframe size'] = self.MyGetSize()
-            # DEBUG wxPhoenix .GetSizeTuple()
+        size = self.DoGetSize()
+        is_full_screen_mode = size == wx.DisplaySize()
+        self._application.settings['mainframe maximized'] = self.IsMaximized() or is_full_screen_mode
+        if not is_full_screen_mode:
+            self._application.settings['mainframe size'] = size
+        self._application.settings['mainframe position'] = \
+            self.DoGetPosition()
         event.Skip()
 
     def OnMove(self, event):
         # When the window is Iconized, a move event is also raised, but we
         # don't want to update the position in the settings file
         if not self.IsIconized() and not self.IsMaximized():
-            # DEBUG wxPhoenix writes wx.Point(50, 30) instead of just (50, 30)
-            self._application.settings['mainframe position'] = \
-                self.MyGetPosition()
-            # DEBUG wxPhoenix self.GetPositionTuple()
+            self._application.settings['mainframe position'] =\
+                self.DoGetPosition()
         event.Skip()
 
     def OnMaximize(self, event):
@@ -392,18 +364,6 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def OnReleasenotes(self, event):
         pass
-
-    def MyGetSize(self):
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            return self.DoGetSize()
-        else:
-            return self.GetSizeTuple()
-
-    def MyGetPosition(self):
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            return self.DoGetPosition()
-        else:
-            return self.GetPositionTuple()
 
     def _allowed_to_exit(self):
         if self.has_unsaved_changes():
@@ -428,13 +388,7 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def _populate_tree(self):
         self.tree.populate(self._controller)
-        if len(self._controller.data.directory) > 1:
-            self.filemgr.SelectPath(self._controller.data.source)
-            try:
-                self.filemgr.ExpandPath(self._controller.data.source)
-            except Exception:
-                pass
-            self.filemgr.Update()
+        self.filemgr.update_tree()
 
     def OnOpenFile(self, event):
         if not self.filemgr:
@@ -457,7 +411,6 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
                 return
             if self.open_suite(path):
                 return
-        from robotide.editor import customsourceeditor
         customsourceeditor.main(path)
 
     def OnMenuOpenFile(self, event):
@@ -474,6 +427,22 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
             self.open_suite(path)  # It is a directory, do not edit
         event.Skip()
 
+    def OnOpenExternalFile(self, event):
+        if not self._current_external_dir:
+            curdir = self._controller.default_dir
+        else:
+            curdir = self._current_external_dir
+        fdlg = wx.FileDialog(self, defaultDir=curdir, style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        if fdlg.ShowModal() == wx.ID_CANCEL:
+            return
+        path = fdlg.GetPath()
+        try:
+            self._current_external_dir = os.path.dirname(path)
+            customsourceeditor.main(path)
+        except IOError:
+            wx.LogError(f"Cannot open file {path}")
+
+
     def OnOpenTestSuite(self, event):
         if not self.check_unsaved_modifications():
             return
@@ -482,7 +451,6 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
         if path:
             if self.open_suite(path):
                 return
-            from robotide.editor import customsourceeditor
             customsourceeditor.main(path)
 
     def check_unsaved_modifications(self):
@@ -495,6 +463,9 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def open_suite(self, path):
         self._controller.update_default_dir(path)
+        # self._controller.default_dir will only save dir path
+        # need to save path to self._application.workspace_path too
+        self._application.workspace_path = path
         try:
             err = self._controller.load_datafile(path, LoadProgressObserver(self))
         finally:
@@ -511,22 +482,18 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def OnOpenDirectory(self, event):
         if self.check_unsaved_modifications():
-            if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-                path = wx.DirSelector(message="Choose a directory containing "
-                                              "Robot files",
-                                      default_path=self._controller.default_dir
-                                      )
-            else:
-                path = wx.DirSelector(message="Choose a directory containing "
-                                              "Robot files",
-                                      defaultPath=self._controller.default_dir)
+            path = wx.DirSelector(message="Choose a directory containing Robot"
+                                          " files",
+                                  default_path=self._controller.default_dir)
             if path:
                 self.open_suite(path)
 
     def OnSave(self, event):
+        RideBeforeSaving().publish()
         self.save()
 
     def OnSaveAll(self, event):
+        RideBeforeSaving().publish()
         self.save_all()
 
     def save_all(self):
@@ -559,8 +526,7 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
 
     def OnViewAllTags(self, event):
         if self._view_all_tags_dialog is None:
-            self._view_all_tags_dialog = ViewAllTagsDialog(self._controller,
-                                                           self)
+            self._view_all_tags_dialog = ViewAllTagsDialog(self._controller, self)
         self._view_all_tags_dialog.show_dialog()
 
     def OnSearchUnusedKeywords(self, event):
@@ -641,6 +607,37 @@ class RideFrame(with_metaclass(classmaker(), wx.Frame, RideEventHandler)):
         ctrl = SizeReportCtrl(self, -1, wx.DefaultPosition, wx.Size(width, height), self._mgr)
         return ctrl
 
+    def show_confirm_reload_dlg(self, event):
+        msg = ['Workspace modifications detected on the file system.',
+               'Do you want to reload the workspace?',
+               'Answering <No> will overwrite the changes on disk.']
+        if self._controller.is_dirty():
+            msg.insert(2, 'Answering <Yes> will discard unsaved changes.')
+        ret = wx.MessageBox('\n'.join(msg), 'Files Changed On Disk',
+                            style=wx.YES_NO | wx.ICON_WARNING)
+        confirmed = ret == wx.YES
+        if confirmed:
+            # workspace_path should update after open directory/suite
+            # There're two scenarios:
+            # 1. path is a directory
+            # 2. path is a suite file
+            new_path = RideFSWatcherHandler.get_workspace_new_path()
+            if new_path and os.path.exists(new_path):
+                wx.CallAfter(self.open_suite, new_path)
+            else:
+                # in case workspace is totally removed
+                # ask user to open new directory
+                # TODO add some notification msg to users
+                wx.CallAfter(self.OnOpenDirectory, event)
+        else:
+            for _ in self._controller.datafiles:
+                if _.has_been_modified_on_disk() or _.has_been_removed_from_disk():
+                    if not os.path.exists(_.directory):
+                        # sub folder is removed, create new one before saving
+                        os.makedirs(_.directory)
+                    _.mark_dirty()
+            self.save_all()
+
 
 # Code moved from actiontriggers
 class ToolBar(aui.AuiToolBar):
@@ -692,24 +689,11 @@ class ToolBar(aui.AuiToolBar):
     def _create_button(self, action):
         button = ToolBarButton(self._frame, self, action)
         name = self._format_button_tooltip(action)
-        self.MyAddTool(self, button.id, label=name,
-                       bitmap=action.icon, shortHelp=name,
-                       longHelp=action.doc)
+        self.AddTool(button.id, name, action.icon, wx.NullBitmap,
+                     wx.ITEM_NORMAL, name, action.doc)
         self.Realize()
         self._buttons.append(button)
         return button
-
-    def MyAddTool(self, obj, toolid, label, bitmap,
-                  bmpDisabled=wx.NullBitmap,
-                  kind=wx.ITEM_NORMAL, shortHelp="", longHelp=""):
-        if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-            obj.AddTool(toolid, label, bitmap, bmpDisabled, kind,
-                        shortHelp, longHelp)
-        else:  # DEBUG Was AddLabelTool for non AUI version
-            obj.AddTool(tool_id=toolid, label=label, bitmap=bitmap,
-                        disabled_bitmap=bmpDisabled, kind=wx.ITEM_NORMAL,
-                        short_help_string=shortHelp,
-                        long_help_string=longHelp, client_data=None)
 
     def _format_button_tooltip(self, action):
         tooltip = action.name.replace('&', '')
@@ -719,7 +703,6 @@ class ToolBar(aui.AuiToolBar):
 
     def remove_toolbar_button(self, button):
         self._buttons.remove(button)
-        # self._wx_toolbar.RemoveTool(button.id)
         self.DeleteTool(button.id)
         self.Realize()
 
@@ -812,3 +795,13 @@ class ShortcutKeysDialog(Dialog):
 
     def _get_platform_specific_shortcut_keys(self):
         return localize_shortcuts(SHORTCUT_KEYS)
+
+
+class RIDETaskBarIcon(TaskBarIcon):
+
+    def __init__(self, img_provider):
+        TaskBarIcon.__init__(self, TBI_DOCK)
+        self._img_provider = img_provider
+        if IS_MAC:
+            # only use in mac to display RIDE app icon in dock
+            self.SetIcon(wx.Icon(self._img_provider.RIDE_ICON), "RIDE")

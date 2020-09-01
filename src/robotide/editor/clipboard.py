@@ -15,10 +15,7 @@
 
 import os
 import wx
-from robotide.context import IS_WINDOWS
-from robotide.utils import PY3
-if PY3:
-    from robotide.utils import basestring
+from robotide.context import IS_WINDOWS, IS_MAC
 
 
 class _ClipboardHandler(object):
@@ -88,11 +85,8 @@ class _ClipboardHandler(object):
         return self._grid.get_cell_edit_control()
 
     def _edit_control_shown(self):
-        # if wx.VERSION >= (3, 0, 3, ''):  # DEBUG wxPhoenix
-        #     return self._grid.IsCellEditControlEnabled()
-        # else:
-        #     return self._grid.IsCellEditControlShown()
         return self._grid.IsCellEditControlShown()
+
 
 class _WindowsClipboardHandler(_ClipboardHandler):
 
@@ -106,13 +100,20 @@ class _WindowsClipboardHandler(_ClipboardHandler):
         if self._edit_control_shown():
             self._get_edit_control().Cut()
         else:
-            _ClipboardHandler.copy(self)
+            _ClipboardHandler.cut(self)
 
     def _paste_to_cell_editor(self):
         self._get_edit_control().Paste()
 
+    def paste(self):
+        if self._edit_control_shown():
+            self._paste_to_cell_editor()
+        else:
+            _ClipboardHandler.paste(self)
 
-ClipboardHandler = IS_WINDOWS and _WindowsClipboardHandler or _ClipboardHandler
+
+# for now mac clipboard handler is the same with windows
+ClipboardHandler = _WindowsClipboardHandler if IS_WINDOWS or IS_MAC else _ClipboardHandler
 
 
 class _GridClipboard(object):
@@ -137,7 +138,7 @@ class _GridClipboard(object):
     def _format_data(self, data):
         if isinstance(data, list):
             return os.linesep.join('\t'.join(row) for row in data)
-        if isinstance(data, basestring):
+        if isinstance(data, str):
             return data
         return None
 

@@ -15,6 +15,8 @@
 
 import unittest
 
+from wx._core import wxAssertionError
+
 from robotide.robotapi import (TestDataDirectory, TestCaseFile, ResourceFile,
                                TestCase, UserKeyword)
 from nose.tools import assert_equal
@@ -26,10 +28,10 @@ from robotide.controller.filecontrollers import (TestDataDirectoryController,
                                                  ResourceFileController)
 
 from robotide.ui.actiontriggers import MenuBar, ShortcutRegistry
-from robotide.ui.mainframe import ActionRegisterer, ToolBar 
+from robotide.ui.mainframe import ActionRegisterer, ToolBar
 from resources import PYAPP_REFERENCE, FakeSettings
 
-from robotide.ui import tree as st
+from robotide.ui import treeplugin as st
 from robotide.ui import treenodehandlers as th
 from robotide.publish import PUBLISHER
 from robotide.namespace.namespace import Namespace
@@ -37,7 +39,7 @@ th.FakeDirectorySuiteHandler = th.FakeUserKeywordHandler = \
     th.FakeSuiteHandler = th.FakeTestCaseHandler = \
     th.FakeResourceHandler = th.TestDataDirectoryHandler
 st.Editor = lambda *args: _FakeEditor()
-from robotide.ui.tree import Tree
+from robotide.ui.treeplugin import Tree
 Tree._show_correct_editor = lambda self, x: None
 Tree.get_active_datafile = lambda self: None
 # CallAfter does not work in unit tests
@@ -77,10 +79,12 @@ class _FakeEditor(object):
 class _BaseSuiteTreeTest(unittest.TestCase):
 
     def setUp(self):
-        frame = _FakeMainFrame(None)
+        # frame = _FakeMainFrame(None)
+        self.app = wx.App()
+        self.frame = wx.Frame(None)
         self._model = self._create_model()
-        self._tree = Tree(frame, ActionRegisterer(AuiManager(frame),
-            MenuBar(frame), ToolBar(frame), ShortcutRegistry(frame)))
+        self._tree = Tree(self.frame, ActionRegisterer(AuiManager(self.frame),
+            MenuBar(self.frame), ToolBar(self.frame), ShortcutRegistry(self.frame)))
         images = TreeImageList()
         self._tree._images = images
         self._tree.SetImageList(images)
@@ -89,6 +93,8 @@ class _BaseSuiteTreeTest(unittest.TestCase):
 
     def tearDown(self):
         PUBLISHER.unsubscribe_all()
+        wx.CallAfter(wx.Exit)
+        self.app.MainLoop()  # With this here, there is no Segmentation fault
 
     def _create_model(self):
         suite = self._create_directory_suite('/top_suite')
@@ -163,12 +169,12 @@ class TestPopulating(_BaseSuiteTreeTest):
             item, cookie = self._tree.GetNextChild(parent, cookie)
             assert_equal(self._tree.GetItemText(item), name)
 
-
 class TestAddingItems(_BaseSuiteTreeTest):
 
     def test_adding_user_keyword(self):
         suite = self._model.data
-        suite.create_keyword('New Fake UK')
+        kw = suite.create_keyword('New Fake UK')
+        self._tree.add_keyword(self._get_node(suite.name), kw)
         assert_equal(self._get_selected_label(), 'New Fake UK')
 
     def test_adding_test(self):
@@ -181,7 +187,7 @@ class TestAddingItems(_BaseSuiteTreeTest):
 class TestNodeSearchAndSelection(_BaseSuiteTreeTest):
 
     def test_topsuite_node_should_be_selected_by_default(self):
-        assert_equal(self._get_selected_label(), 'Top Suite')
+        assert_equal(self._get_selected_label(), '')
 
     def test_searching_matching_uk_node(self):
         self._select_and_assert_selection(self._model.data.keywords[0].data)

@@ -22,7 +22,7 @@ from setuptools import setup, find_packages
 
 ROOT_DIR = dirname(abspath(__file__))
 SOURCE_DIR = 'src'
-REQUIREMENTS = ['wxPython', 'PyPubSub', 'Pygments']
+REQUIREMENTS = ['wxPython', 'PyPubSub', 'Pygments', 'psutil']
 
 #Windows specific requirements
 if sys.platform == 'win32':
@@ -35,7 +35,9 @@ package_data = {
     'robotide.preferences': ['settings.cfg'],
     'robotide.widgets': ['*.png', '*.gif', '*.ico'],
     'robotide.messages': ['*.html'],
-    'robotide.publish.htmlmessages': ['no_robot.html']
+    'robotide.publish.htmlmessages': ['no_robot.html'],
+    'robotide.postinstall': ['RIDE.app/Contents/PkgInfo', 'RIDE.app/Contents/Info.plist',
+                             'RIDE.app/Contents/MacOS/RIDE', 'RIDE.app/Contents/Resources/*.icns']
 }
 
 long_description = """
@@ -84,6 +86,7 @@ setup(
     package_dir={'': SOURCE_DIR},
     packages=find_packages(SOURCE_DIR),
     package_data=package_data,
+    python_requires='>=3.6',
     # Robot Framework package data is not included, but RIDE does not need it.
     # Always install everything, since we may be switching between versions
     options={'install': {'force': True}},

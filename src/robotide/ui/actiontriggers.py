@@ -14,8 +14,6 @@
 #  limitations under the License.
 
 import wx
-import wx.lib.agw.aui as aui
-
 from robotide.context import IS_WINDOWS, IS_MAC
 
 ID_CustomizeToolbar = wx.ID_HIGHEST + 1
@@ -129,16 +127,17 @@ class _Menu(object):
             return get_name(action.name)
         sht = action.get_shortcut()
         if sht:
-            # print("DEBUG: actiontriggers name:%s shtcut:(%s)" % (get_name(action.name), action.get_shortcut()))
             return '%s    (%s)' % (get_name(action.name), sht)
         return '%s' % get_name(action.name)
 
     def _create_menu_item(self, action):
-        name_with_accerelator = self._get_name(action, build_new=True)
-        menu_item = MenuItem(self._frame, self, name_with_accerelator)
+        name_with_accelerator = self._get_name(action, build_new=True)
+        menu_item = MenuItem(self._frame, self, name_with_accelerator)
         pos = action.get_insertion_index(self.wx_menu)
         wx_menu_item = self.wx_menu.Insert(pos, menu_item.id,
                                            menu_item.name, action.doc)
+        if action.icon:
+            wx_menu_item.SetBitmap(action.icon)
         menu_item.set_wx_menu_item(wx_menu_item)
         return menu_item
 
@@ -161,7 +160,6 @@ class _NameBuilder(object):
             name = self._use_given_accelerator(name)
         except ValueError:
             name = self._generate_accelerator(name)
-            # print("DEBUG: actiontriggers get_name on ValueErr: %s" % name)
         self._register(name)
         return name
 
@@ -234,7 +232,6 @@ class SeparatorMenuItem(_MenuItem):
         _MenuItem.set_wx_menu_item(self, wx_menu_item)
         # Should get  ITEM_SEPARATOR
         self.id = wx.ID_SEPARATOR
-        # self._wx_menu_item.SetId(self.id)  # DEBUG Not in wxPhoenix
 
     def _is_enabled(self):
         return False
@@ -283,27 +280,28 @@ class ShortcutRegistry(object):
     def register(self, action):
         if action.has_shortcut() and action.has_action():
             delegator = self._actions.setdefault(action.get_shortcut(),
-                                                 ActionDelegator(self._frame, action.shortcut))
+                                                 ActionDelegator(self._frame,
+                                                 action.shortcut))
             delegator.add(action)
             action.register(self)
-            self._update_accerelator_table()
+            self._update_accelerator_table()
 
     def unregister(self, action):
         key = action.get_shortcut()
         if self._actions[key].remove(action):
             del(self._actions[key])
-        self._update_accerelator_table()
+        self._update_accelerator_table()
 
-    def _update_accerelator_table(self):
-        accerelators = []
+    def _update_accelerator_table(self):
+        accelerators = []
         for delegator in self._actions.values():
-            # print("DEBUG: actiontrigger updateacelerators  delegator %s" % delegator)
             try:
                 flags, key_code = delegator.shortcut.parse()
             except TypeError:
                 continue
-            accerelators.append(wx.AcceleratorEntry(flags, key_code, delegator.id))
-        self._frame.SetAcceleratorTable(wx.AcceleratorTable(accerelators))
+            accelerators.append(wx.AcceleratorEntry(flags, key_code,
+                                                    delegator.id))
+        self._frame.SetAcceleratorTable(wx.AcceleratorTable(accelerators))
 
 
 class ActionDelegator(object):
@@ -311,7 +309,7 @@ class ActionDelegator(object):
     def __init__(self, frame, shortcut=None):
         self._frame = frame
         self.shortcut = shortcut
-        self.id = wx.NewId()
+        self.id = wx.NewIdRef()
         self._actions = []
 
     def add(self, action):
